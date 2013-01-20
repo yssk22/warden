@@ -9,6 +9,18 @@ packages="openssh-server,rsync"
 suite="lucid"
 mirror=$(grep "^deb" /etc/apt/sources.list | head -n1 | cut -d" " -f2)
 
+if [ -r /etc/lsb-release ]
+then
+  source /etc/lsb-release
+  if [ -n "$DISTRIB_CODENAME" ]
+  then
+    suite=$DISTRIB_CODENAME
+  fi
+else
+  suite=$(lsb_release -cs)
+fi
+
+
 # Fallback to default Ubuntu mirror when mirror could not be determined
 if [ -z "$mirror" ]
 then
