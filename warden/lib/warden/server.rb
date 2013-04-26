@@ -23,6 +23,21 @@ module Warden
   module Server
 
     class Drainer
+      class DrainNotifier < ::EM::Connection
+        def initialize(drainer)
+          @drainer = drainer
+        end
+
+        def notify_readable
+          begin
+            @io.read_nonblock(65536)
+          rescue IO::WaitReadable
+          end
+
+          @drainer.drain
+        end
+      end
+
       module State
         INACTIVE             = 0 # Drain not yet initiated
         START                = 1 # Drain initiated, closing accept socket
@@ -32,11 +47,31 @@ module Warden
         DONE                 = 5 # Accept socket closed, no active conns
       end
 
-      def initialize(server)
+      def initialize(server, signal)
         @server = server
         @connections = Set.new
         @state = State::INACTIVE
         @on_complete_callbacks = []
+
+        setup(signal)
+      end
+
+      # The signal handler writes to a pipe to make it work with EventMachine.
+      # If a signal handler calls into EventMachine directly it may result in
+      # recursive locking, crashing the process.
+      def setup(signal)
+        @pipe = IO.pipe
+        @notifier = ::EM.watch(@pipe[0], DrainNotifier, self)
+        @notifier.notify_readable = true
+
+        @prev_handler = ::Signal.trap(signal) do
+          begin
+            @pipe[1].write_nonblock("x")
+          rescue IO::WaitWritable
+          end
+
+          @prev_handler.call if @prev_handler.respond_to?(:call)
+        end
       end
 
       def drain
@@ -50,14 +85,14 @@ module Warden
       end
 
       def register_connection(conn)
-        logger.debug("Connection registered: #{conn}")
+        logger.debug2("Connection registered: #{conn}")
 
         @connections.add(conn)
         run_machine
       end
 
       def unregister_connection(conn)
-        logger.debug("Connection unregistered: #{conn}")
+        logger.debug2("Connection unregistered: #{conn}")
 
         @connections.delete(conn)
         run_machine
@@ -154,12 +189,14 @@ module Warden
     end
 
     def self.setup_network
-      network_start_address = Network::Address.new(config.network["pool_start_address"])
-      network_size = config.network["pool_size"]
-      network_pool = Pool::Network.new(network_start_address, network_size)
+      network_pool = Pool::Network.new(config.network["pool_network"])
       container_klass.network_pool = network_pool
+    end
 
-      port_pool = Pool::Port.new
+    def self.setup_port
+      port_start_port = config.port["pool_start_port"]
+      port_size = config.port["pool_size"]
+      port_pool = Pool::Port.new(port_start_port, port_size)
       container_klass.port_pool = port_pool
     end
 
@@ -176,6 +213,7 @@ module Warden
       setup_server
       setup_logging
       setup_network
+      setup_port
       setup_user
     end
 
@@ -184,51 +222,39 @@ module Warden
       max_job_id = 0
 
       Dir.glob(File.join(container_klass.container_depot_path, "*")) do |path|
-        next unless File.exist?(container_klass.snapshot_path(path))
-
-        c = container_klass.from_snapshot(path)
-        next unless c
-
-        logger.info("Recovered container from #{path}")
-        logger.debug("Container resources: #{c.resources}")
-
-        if c.resources.has_key?("ports")
-          container_klass.port_pool.delete(*c.resources["ports"])
-        end
-        container_klass.uid_pool.delete(c.resources["uid"])
-        container_klass.network_pool.delete(c.resources["network"])
-
-        c.jobs.each do |job_id, job|
-          max_job_id = job_id > max_job_id ? job_id : max_job_id
+        if !File.exist?(container_klass.snapshot_path(path))
+          logger.info("Destroying container without snapshot at: #{path}")
+          system(File.join(container_klass.root_path, "destroy.sh"), path)
+          next
         end
 
-        container_klass.registry[c.handle] = c
+        if !container_klass.alive?(path)
+          logger.info("Destroying dead container at: #{path}")
+          system(File.join(container_klass.root_path, "destroy.sh"), path)
+          next
+        end
+
+        begin
+          c = container_klass.from_snapshot(path)
+
+          logger.info("Recovered container at: #{path}", :resources => c.resources)
+
+          c.jobs.each do |job_id, job|
+            max_job_id = job_id > max_job_id ? job_id : max_job_id
+          end
+
+          container_klass.registry[c.handle] = c
+        rescue WardenError => err
+          logger.log_exception(err)
+
+          logger.warn("Destroying unrecoverable container at: #{path}")
+          system(File.join(container_klass.root_path, "destroy.sh"), path)
+        end
       end
 
       container_klass.job_id = max_job_id
 
       nil
-    end
-
-    def self.drained_sentinel_path
-      File.join(config.server["container_depot_path"], "drained")
-    end
-
-    def self.write_drained_sentinel
-      File.open(drained_sentinel_path, "w+") do |f|
-        f.write(Time.now.to_i)
-      end
-    end
-
-    def self.read_drained_sentinel
-      sentinel = false
-
-      if File.exist?(drained_sentinel_path)
-        sentinel = true
-        FileUtils.rm(drained_sentinel_path)
-      end
-
-      sentinel
     end
 
     def self.run!
@@ -237,21 +263,20 @@ module Warden
       old_soft, old_hard = Process.getrlimit(:NOFILE)
       Process.setrlimit(Process::RLIMIT_NOFILE, 32768)
       new_soft, new_hard = Process.getrlimit(:NOFILE)
-      logger.debug("rlimit_nofile: %d => %d" % [old_soft, new_soft])
+      logger.debug2("rlimit_nofile: %d => %d" % [old_soft, new_soft])
+
+      # Log configuration
+      logger.info("Configuration", config.to_hash)
 
       ::EM.run {
         f = Fiber.new do
-          drained = read_drained_sentinel
-
-          container_klass.setup(self.config, drained)
+          container_klass.setup(self.config)
 
           ::EM.error_handler do |error|
             logger.log_exception(error)
           end
 
-          if drained
-            recover_containers
-          end
+          recover_containers
 
           FileUtils.rm_f(unix_domain_path)
           server = ::EM.start_unix_domain_server(unix_domain_path, ClientConnection)
@@ -259,27 +284,23 @@ module Warden
                             config.health_check_server["port"],
                             HealthCheck)
 
-          @drainer = Drainer.new(server)
+          @drainer = Drainer.new(server, "USR2")
           @drainer.on_complete do
             Fiber.new do
               logger.info("Drain complete")
               # Serialize container state
               container_klass.registry.each { |_, c| c.write_snapshot }
 
-              # Write out sentinel so we know to recover on next startup
-              write_drained_sentinel
-
               EM.stop
             end.resume
           end
-          Signal.trap("USR2") { @drainer.drain }
 
           # This is intentionally blocking. We do not want to start accepting
           # connections before permissions have been set on the socket.
           FileUtils.chmod(unix_domain_permissions, unix_domain_path)
 
           # Let the world know Warden is ready for action.
-          logger.info("Listening on #{unix_domain_path}, and ready for action.")
+          logger.info("Listening on #{unix_domain_path}")
         end
 
         f.resume
@@ -308,11 +329,18 @@ module Warden
         @closing = false
         @requests = []
         @buffer = Protocol::Buffer.new
+        @bound = true
 
         Server.drainer.register_connection(self)
       end
 
+      def bound?
+        @bound
+      end
+
       def unbind
+        @bound = false
+
         f = Fiber.new { emit(:close) }
         f.resume
 
@@ -329,19 +357,21 @@ module Warden
       end
 
       def drain
-        logger.debug("Draining connection")
+        logger.debug("Draining connection on: #{self}")
 
         @draining = true
 
         if PREEMPTIVELY_CLOSE_ON_DRAIN.include?(@current_request.class)
-          logger.debug("Current request is #{@current_request.class}, closing connection")
+          logger.debug("Current request is #{@current_request.class}, closing connection on #{self}")
           close
         else
-          logger.debug("Current request is #{@current_request.class}, waiting for completion")
+          logger.debug("Current request is #{@current_request.class}, waiting for completion on #{self}")
         end
       end
 
       def send_response(obj)
+        logger.debug2(obj.inspect)
+
         data = obj.wrap.encode.to_s
         send_data data.length.to_s + "\r\n"
         send_data data + "\r\n"
@@ -375,7 +405,7 @@ module Warden
 
         return if request.nil?
 
-        logger.debug2(request)
+        logger.debug2(request.inspect)
 
         f = Fiber.new {
           begin
@@ -388,7 +418,7 @@ module Warden
             @blocked = false
 
             if @draining
-              logger.debug2("Finished processing request, closing")
+              logger.debug("Finished processing request, closing #{self}")
               close
             else
               # Resume processing the input buffer
@@ -431,7 +461,10 @@ module Warden
           end
         end
       rescue WardenError => e
-        send_error e
+        send_error(e)
+      rescue => e
+        logger.log_exception(e)
+        send_error(e)
       end
 
       def process_container_request(request, container)
@@ -457,6 +490,8 @@ module Warden
 
         when Protocol::StreamRequest
           response = container.dispatch(request) do |name, data|
+            break if !bound?
+
             response = request.create_response
             response.name = name
             response.data = data

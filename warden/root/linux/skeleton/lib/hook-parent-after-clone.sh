@@ -10,7 +10,7 @@ cd $(dirname $0)/../
 source ./lib/common.sh
 
 # Add new group for every subsystem
-for system_path in /sys/fs/cgroup/*
+for system_path in /tmp/warden/cgroup/*
 do
   instance_path=$system_path/instance-$id
 
@@ -42,7 +42,6 @@ do
     echo "c 136:* rw" > $instance_path/devices.allow
   fi
 
-  echo 1 > $instance_path/cgroup.clone_children
   echo $PID > $instance_path/tasks
 done
 

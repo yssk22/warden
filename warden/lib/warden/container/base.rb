@@ -6,11 +6,12 @@ require "warden/event_emitter"
 require "warden/util"
 
 require "eventmachine"
-require "json"
+require "fileutils"
 require "set"
 require "steno"
 require "steno/core_ext"
 require "warden/protocol"
+require "yajl"
 
 module Warden
 
@@ -71,7 +72,7 @@ module Warden
         attr_accessor :uid_pool
 
         # Called before the server starts.
-        def setup(config, drained = false)
+        def setup(config)
           @root_path = File.join(Warden::Util.path("root"),
                                  self.name.split("::").last.downcase)
 
@@ -114,10 +115,6 @@ module Warden
           File.join(container_path, "snapshot.json")
         end
 
-        def dirty_snapshot_marker_path(container_path)
-          File.join(container_path, "snapshot_dirty")
-        end
-
         def empty_snapshot
           { "events"     => [],
             "grace_time" => Server.container_grace_time,
@@ -128,13 +125,17 @@ module Warden
           }
         end
 
+        def alive?(_)
+          true
+        end
+
         def from_snapshot(container_path)
-          return nil if File.exists?(dirty_snapshot_marker_path(container_path))
-          snapshot = JSON.parse(File.read(snapshot_path(container_path)))
+          snapshot = Yajl::Parser.parse(File.read(snapshot_path(container_path)), :check_utf8 => false)
           snapshot["resources"]["network"] = Warden::Network::Address.new(snapshot["resources"]["network"])
 
           c = new(snapshot)
-          c.acquire
+          c.container_path = container_path
+          c.restore
 
           c
         end
@@ -150,7 +151,7 @@ module Warden
 
       def initialize(snapshot = {}, jobs = {})
         snapshot = self.class.empty_snapshot.merge(snapshot)
-        @resources   = Hash.new { |h,k| raise WardenError.new("Unknown resource: #{k}") }
+        @resources   = {}
         @resources.update(snapshot["resources"])
         @acquired    = {}
         @connections = ::Set.new
@@ -166,12 +167,11 @@ module Warden
       end
 
       def handle
-        @handle ||= resources["handle"] if resources.has_key?("handle")
-        @handle ||= container_id
+        @resources["handle"]
       end
 
       def container_id
-        @container_id ||= self.class.generate_container_id
+        @resources["container_id"]
       end
 
       def host_ip
@@ -189,7 +189,7 @@ module Warden
       def cancel_grace_timer
         return unless @destroy_timer
 
-        logger.debug("Grace timer: cancel")
+        logger.debug2("Grace timer: cancel")
 
         ::EM.cancel_timer(@destroy_timer)
         @destroy_timer = nil
@@ -198,17 +198,16 @@ module Warden
       def setup_grace_timer
         return if grace_time.nil?
 
-        logger.debug("Grace timer: setup (fires in %.3fs)" % grace_time)
+        logger.debug2("Grace timer: setup (fires in %.3fs)" % grace_time)
 
         @destroy_timer = ::EM.add_timer(grace_time) do
-          logger.debug("Grace timer: fire")
           fire_grace_timer
         end
       end
 
       def fire_grace_timer
         f = Fiber.new do
-          logger.debug("Grace timer: issue destroy")
+          logger.info("Grace timer fired, destroying container")
 
           begin
             dispatch(Protocol::DestroyRequest.new)
@@ -252,7 +251,11 @@ module Warden
       end
 
       def container_path
-        @container_path ||= File.join(container_depot_path, handle)
+        @container_path ||= File.join(container_depot_path, container_id)
+      end
+
+      def container_path=(path)
+        @container_path ||= path
       end
 
       def hook(name, request, response, &blk)
@@ -286,19 +289,15 @@ module Warden
         self.class.snapshot_path(container_path)
       end
 
-      def dirty_snapshot_marker_path
-        self.class.dirty_snapshot_marker_path(container_path)
-      end
-
       def dispatch(request, &blk)
-        logger.debug2("Request: #{request.inspect}")
-
         klass_name = request.class.name.split("::").last
         klass_name = klass_name.gsub(/Request$/, "")
         klass_name = klass_name.gsub(/(.)([A-Z])/) { |m| "#{m[0]}_#{m[1]}" }
         klass_name = klass_name.downcase
 
         response = request.create_response
+
+        t1 = Time.now
 
         before_method = "before_%s" % klass_name
         hook(before_method, request, response)
@@ -314,7 +313,11 @@ module Warden
         emit(after_method.to_sym)
         hook(after_method, request, response)
 
-        logger.debug2("Response: #{response.inspect}")
+        t2 = Time.now
+
+        logger.info("%s (took %.6f)" % [klass_name, t2 - t1],
+                    :request => request.to_hash,
+                    :response => response.to_hash)
 
         response
       end
@@ -327,29 +330,15 @@ module Warden
         end
       end
 
-      def write_snapshot(opts = {})
-        logger.info("Writing snapshot for container #{handle}")
+      def delete_snapshot
+        FileUtils.rm_f(snapshot_path)
+      end
 
-        FileUtils.touch(dirty_snapshot_marker_path)
+      def write_snapshot
+        t1 = Time.now
 
         jobs_snapshot = {}
-
-        # The default setting is that snapsnotting a job will first terminate
-        # it. But this can be overridden by setting :keep_alive to true, in
-        # which case we only want to snapshot terminated jobs and leave running
-        # jobs alone, but still generate an empty snapshot for the running job
-        # so that we don't lose track of it upon restart of warden.
-        if opts[:keep_alive]
-          jobs.each do |id, job|
-            if job.terminated?
-              jobs_snapshot[id] = job.create_snapshot
-            else
-              jobs_snapshot[id] = job.create_empty_snapshot
-            end
-          end
-        else
-          jobs.each { |id, job| jobs_snapshot[id] = job.create_snapshot }
-        end
+        jobs.each { |id, job| jobs_snapshot[id] = job.to_snapshot }
 
         snapshot = {
           "events"     => events.to_a,
@@ -360,27 +349,55 @@ module Warden
           "state"      => state,
         }
 
-        File.open(snapshot_path, "w+") do |f|
-          f.write(JSON.dump(snapshot))
-        end
+        file = Tempfile.new("snapshot", File.join(container_path, "tmp"))
+        file.write(Yajl::Encoder.encode(snapshot, :check_utf8 => false))
+        file.close
 
-        FileUtils.remove_file(dirty_snapshot_marker_path, true)
+        File.rename(file.path, snapshot_path)
+
+        t2 = Time.now
+
+        logger.debug("Wrote snapshot in %.6f" % [t2 - t1])
 
         nil
       end
 
+      # Restore state from snapshot
+      def restore
+        acquire
+
+        if @resources.has_key?("ports")
+          self.class.port_pool.delete(*@resources["ports"])
+        end
+
+        if @resources.has_key?("uid")
+          self.class.uid_pool.delete(@resources["uid"])
+        end
+
+        if @resources.has_key?("network")
+          self.class.network_pool.delete(@resources["network"])
+        end
+      rescue WardenError
+        release
+        raise
+      end
+
       # Acquire resources required for every container instance.
       def acquire(opts = {})
-        if @resources.has_key?("handle")
-          # Restored from snapshot
-        elsif opts[:handle]
-          if self.class.registry[opts[:handle]]
-            raise WardenError.new("container with handle: #{opts[:handle]} already exists.")
-          end
+        if !@resources.has_key?("container_id")
+          @resources["container_id"] = self.class.generate_container_id
+        end
 
-          @resources["handle"] = opts[:handle]
-        else
-          @resources["handle"] = handle
+        if !@resources.has_key?("handle")
+          if opts[:handle]
+            if self.class.registry[opts[:handle]]
+              raise WardenError.new("container with handle: #{opts[:handle]} already exists.")
+            end
+
+            @resources["handle"] = opts[:handle]
+          else
+            @resources["handle"] = @resources["container_id"]
+          end
         end
 
         if @resources.has_key?("network")
@@ -388,7 +405,7 @@ module Warden
         elsif opts[:network]
           # Translate to network address by network pool netmask
           container = Warden::Network::Address.new(opts[:network])
-          network = container.network(self.class.network_pool.netmask)
+          network = container.network(self.class.network_pool.pooled_netmask)
 
           unless self.class.network_pool.fetch(network)
             raise WardenError.new("Could not acquire network: #{network.to_human}")
@@ -441,9 +458,6 @@ module Warden
           if request.grace_time
             self.grace_time = request.grace_time
           end
-
-          self.state = State::Active
-
         rescue
           release
           raise
@@ -451,6 +465,8 @@ module Warden
       end
 
       def after_create(request, response)
+        self.state = State::Active
+
         # Clients should be able to look this container up
         self.class.registry[handle] = self
 
@@ -481,25 +497,34 @@ module Warden
         raise WardenError.new("not implemented")
       end
 
-      def before_stop
+      def around_stop
         check_state_in(State::Active)
 
         self.state = State::Stopped
+
+        begin
+          delete_snapshot
+
+          yield
+
+          # Wait for all jobs to terminate (postcondition of stop)
+          jobs.each_value(&:yield)
+        ensure
+          # Arguably the snapshot shouldn't be persisted when stop fails, but
+          # failure of any essential command needs to be thought about more
+          # before making an impromptu decision here.
+          write_snapshot
+        end
       end
 
       def do_stop(request, response)
         raise WardenError.new("not implemented")
       end
 
-      def after_stop(request, response)
-        # Wait for all jobs to terminate before writing a snapshot
-        jobs.each_value(&:yield)
-
-        write_snapshot
-      end
-
       def before_destroy
-        check_state_in(State::Active, State::Stopped)
+        check_state_in(State::Born, State::Active, State::Stopped)
+
+        delete_snapshot
 
         # Clients should no longer be able to look this container up
         self.class.registry.delete(handle)
@@ -523,8 +548,15 @@ module Warden
         raise WardenError.new("not implemented")
       end
 
-      def before_spawn
+      def around_spawn
         check_state_in(State::Active)
+
+        begin
+          delete_snapshot
+          yield
+        ensure
+          write_snapshot
+        end
       end
 
       def do_spawn(request, response)
@@ -532,10 +564,6 @@ module Warden
         jobs[job.job_id] = job
 
         response.job_id = job.job_id
-      end
-
-      def after_spawn(request, response)
-        write_snapshot(:keep_alive => true)
       end
 
       def do_link(request, response)
@@ -546,6 +574,8 @@ module Warden
         end
 
         exit_status, stdout, stderr = job.yield
+
+        job.cleanup(@jobs)
 
         response.exit_status = exit_status
         response.stdout = stdout
@@ -560,6 +590,8 @@ module Warden
         end
 
         response.exit_status = job.stream(&blk)
+
+        job.cleanup(@jobs)
       end
 
       def do_run(request, response)
@@ -584,16 +616,30 @@ module Warden
         response.stderr = link_response.stderr
       end
 
-      def before_net_in
+      def around_net_in
         check_state_in(State::Active)
+
+        begin
+          delete_snapshot
+          yield
+        ensure
+          write_snapshot
+        end
       end
 
       def do_net_in(request, response)
         raise WardenError.new("not implemented")
       end
 
-      def before_net_out
+      def around_net_out
         check_state_in(State::Active)
+
+        begin
+          delete_snapshot
+          yield
+        ensure
+          write_snapshot
+        end
       end
 
       def do_net_out(request, response)
@@ -616,24 +662,45 @@ module Warden
         raise WardenError.new("not implemented")
       end
 
-      def before_limit_memory
+      def around_limit_memory
         check_state_in(State::Active, State::Stopped)
+
+        begin
+          delete_snapshot
+          yield
+        ensure
+          write_snapshot
+        end
       end
 
       def do_limit_memory(request, response)
         raise WardenError.new("not implemented")
       end
 
-      def before_limit_disk
+      def around_limit_disk
         check_state_in(State::Active, State::Stopped)
+
+        begin
+          delete_snapshot
+          yield
+        ensure
+          write_snapshot
+        end
       end
 
       def do_limit_disk(request, response)
         raise WardenError.new("not implemented")
       end
 
-      def before_limit_bandwidth
+      def around_limit_bandwidth
         check_state_in(State::Active, State::Stopped)
+
+        begin
+          delete_snapshot
+          yield
+        ensure
+          write_snapshot
+        end
       end
 
       def do_limit_bandwidth(request, response)
@@ -755,7 +822,7 @@ module Warden
         raise WardenError.new("iomux-spawn failed")  if spawner_alive == :no
 
         # Wait for the spawned child to be continued
-        job = Job.new(self, job_id)
+        job = Job.new(self, job_id, "iomux_spawn_pid" => spawner.pid)
         job.logger = logger
         job.run
 
@@ -772,6 +839,12 @@ module Warden
 
         jobs_snapshot.each do |job_id, job_snapshot|
           job = Job.new(self, Integer(job_id), job_snapshot)
+
+          if !job.terminated? && job.stale?
+            job.cleanup
+            next
+          end
+
           job.logger = logger
           job.run
 
@@ -800,14 +873,14 @@ module Warden
 
         attr_reader :container
         attr_reader :job_id
-        attr_reader :options
+        attr_reader :snapshot
 
         attr_accessor :logger
 
-        def initialize(container, job_id, options = {})
+        def initialize(container, job_id, snapshot = {})
           @container = container
           @job_id = job_id
-          @options = options
+          @snapshot = snapshot
 
           @yielded = []
         end
@@ -820,14 +893,20 @@ module Warden
           File.join(job_root_path, "cursors")
         end
 
+        # Assumption: spawner cleans up after itself
+        def stale?
+          File.directory?(job_root_path) && Dir.glob(File.join(job_root_path, "*.sock")).empty?
+        end
+
+        def terminated?
+          @snapshot.has_key?("status")
+        end
+
         def run
-          if options["status"]
-            @status = options["status"]
-          else
-            @child = DeferredChild.new(File.join(container.bin_path, "iomux-link"),
-                                       "-w", cursors_path, job_root_path,
-                                       :prepend_stdout => options["stdout"],
-                                       :prepend_stderr => options["stderr"])
+          if !terminated?
+            argv = [File.join(container.bin_path, "iomux-link"), "-w", cursors_path, job_root_path]
+
+            @child = DeferredChild.new(*argv, :max => Server.config.server["job_output_limit"])
             @child.logger = logger
             @child.run
 
@@ -835,27 +914,26 @@ module Warden
           end
         end
 
-        def terminated?
-          !!@status
-        end
-
         def yield
-          return @status if @status
-          @yielded << Fiber.current
-          Fiber.yield
+          if !terminated?
+            @yielded << Fiber.current
+            Fiber.yield
+          else
+            @snapshot["status"]
+          end
         end
 
         def resume(status)
-          @status = status
-          @container.write_snapshot(:keep_alive => true)
-          @yielded.each { |f| f.resume(@status) }
+          @snapshot["status"] = status
+          @container.write_snapshot
+          @yielded.each { |f| f.resume(@snapshot["status"]) }
         end
 
         def stream(&block)
           # Handle the case where we are restarted after the job has completed.
           # In this situation there will be no child, hence no stream listeners.
-          if @status
-            exit_status, stdout, stderr = @status
+          if terminated?
+            exit_status, stdout, stderr = @snapshot["status"]
             block.call("stdout", stdout) unless stdout.empty?
             block.call("stderr", stderr) unless stderr.empty?
             return exit_status
@@ -872,60 +950,61 @@ module Warden
           end
 
           # Wait until we have the exit status.
-          unless @status
-            @yielded << Fiber.current
-            Fiber.yield
-          end
-
-          exit_status, _, _ = @status
+          exit_status, _, _ = self.yield
           exit_status
         end
 
-        def create_empty_snapshot
-          return { "stdout" => "", "stderr" => "" }
+        def cleanup(registry = {})
+          # Clean up job root path
+          EM.defer do
+            FileUtils.rm_rf(job_root_path) if File.directory?(job_root_path)
+          end
+
+          # Clear job from registry
+          registry.delete(job_id)
         end
 
-        # This is called during drain or after a job exits, so it is guaranteed
-        # that there are no connections linked to the job.
-        def create_snapshot(opts = {})
-          if @status
-            return { "status" => @status }
-          end
-
-          # Tell the linker to exit in the next tick to avoid a race between
-          # yielding and signal delivery.
-          ::EM.next_tick do
-            begin
-              @child.kill("TERM")
-            rescue Errno::ESRCH
+        def to_snapshot
+          # Drop stdout and stderr because we don't want to recover those after restart
+          snapshot.dup.tap do |s|
+            if s.has_key?("status")
+              s["status"] = [s["status"].first, "", ""]
             end
           end
-
-          self.yield
-
-          { "stdout" => @child.stdout, "stderr" => @child.stderr }
         end
 
         protected
 
+        # An exit status of 255 from the child is ambiguous, and can
+        # mean any one of the following:
+        #
+        # [1] The child exited with status 255.
+        # [2] iomux linking failed with an internal error and exited with
+        #     status of 255.
+        # [3] The child exceeded the set output limit.
+        #
+        # Currently, we don't care about internal failures in iomux linking
+        # and propogate the exit status as such. What we really need is
+        # a clear way to differentiate exit statuses of iomux link from
+        # the underlying child.
         def setup_child_handlers
           @child.callback do
-            # An exit status of 255 from the child is ambiguous, and can
-            # mean any one of the following:
-            #
-            # [1] The child exited with status 255.
-            # [2] iomux linking failed with an internal error and exited with
-            #     status of 255.
-            #
-            # Currently, we don't care about internal failures in iomux linking
-            # and propogate the exit status as such. What we really need is
-            # a clear way to differentiate exit statuses of iomux link from
-            # the underlying child.
             resume [@child.exit_status, @child.stdout, @child.stderr]
           end
 
           @child.errback do |err|
-            resume [nil, nil, nil]
+            # The errback is only called when an error occurred, such as when a
+            # timeout happened, or the maximum output size has been exceeded.
+            # Kill iomux-spawn if this happens.
+            pid = @snapshot["iomux_spawn_pid"]
+            begin
+              Process.kill(:TERM, pid) if pid
+            rescue Errno::EPERM => err
+              logger.warn("Cannot kill PID #{pid}: #{err}")
+            end
+
+            # Resume yielded fibers
+            resume [255, @child.stdout, @child.stderr]
           end
         end
       end

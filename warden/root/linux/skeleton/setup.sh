@@ -33,15 +33,8 @@ EOS
 
 setup_fs
 
-# Remove files we don't need or want
-rm -f mnt/var/cache/apt/archives/*.deb
-rm -f mnt/var/cache/apt/*cache.bin
-rm -f mnt/var/lib/apt/lists/*_Packages
-rm -f mnt/etc/ssh/ssh_host_*
-
 # Strip /dev down to the bare minimum
-rm -rf mnt/dev
-mkdir -p mnt/dev
+rm -rf mnt/dev/*
 
 # /dev/tty
 file=mnt/dev/tty
@@ -81,11 +74,23 @@ cat > mnt/etc/hosts <<-EOS
 $network_container_ip $id
 EOS
 
-# Inherit nameserver(s)
-cp /etc/resolv.conf mnt/etc/
+# By default, inherit the nameserver from the host container.
+#
+# Exception: When the host's nameserver is set to localhost (127.0.0.1), it is
+# assumed to be running its own DNS server and listening on all interfaces.
+# In this case, the warden container must use the network_host_ip address
+# as the nameserver.
+if [[ "$(cat /etc/resolv.conf)" == "nameserver 127.0.0.1" ]]
+then
+  cat > mnt/etc/resolv.conf <<-EOS
+nameserver $network_host_ip
+EOS
+else
+  cp /etc/resolv.conf mnt/etc/
+fi
 
 # Add vcap user if not already present
-$(which chroot) mnt env -i /bin/bash <<-EOS
+$(which chroot) mnt env -i /bin/bash -l <<-EOS
 if ! id vcap > /dev/null 2>&1
 then
   useradd -mU -u $user_uid -s /bin/bash vcap

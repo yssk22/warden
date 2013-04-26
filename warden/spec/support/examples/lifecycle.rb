@@ -11,6 +11,19 @@ shared_examples "lifecycle" do
     response.handle.should == "test_handle"
   end
 
+  it "should allow to create a container with a custom non-ASCII handle" do
+    response = client.create(:handle => "\x80")
+    response.handle.should == "\x80".force_encoding("BINARY")
+  end
+
+  it "should allow to use a container created with a custom handle" do
+    response = client.create(:handle => "test_handle")
+    response.handle.should == "test_handle"
+
+    info = client.info(:handle => "test_handle")
+    info.should_not be_nil
+  end
+
   it "should not allow to recreate a container that already exists" do
     response = client.create(:handle => "test_handle")
     response.handle.should == "test_handle"
@@ -43,36 +56,51 @@ shared_examples "lifecycle" do
     attr_reader :handle
     attr_reader :job_id
 
+    let(:stream_client) { create_client }
+    let(:link_client) { create_client }
+    let(:stop_client) { create_client }
+
     before do
       @handle = client.create.handle
 
       response = client.spawn \
         :handle => handle,
-        :script => "set -e; trap 'exit 37' SIGTERM; echo x; sleep 5s;"
+        :script => "set -e; trap 'exit 37' SIGTERM; echo x; sleep 5s; echo y; exit 38;"
 
       @job_id = response.job_id
 
       # Make sure that the process is actually running inside the container
-      stream_client = create_client
       stream_client.write(Warden::Protocol::StreamRequest.new(:handle => handle,
                                                               :job_id => @job_id))
-      stream_client.read
+      response = stream_client.read
+      response.name.should == "stdout"
+      response.data.should == "x\n"
+      response.exit_status.should == nil
+
       stream_client.disconnect
     end
 
     it "can run in the background" do
-      client.stop(:handle => handle, :background => true)
+      link_client.write(Warden::Protocol::LinkRequest.new(:handle => handle,
+                                                          :job_id => @job_id))
+
+
+      stop_client.stop(:handle => handle, :background => true)
 
       # Test that exit status is returned (because of SIGTERM)
-      response = client.link(:handle => handle, :job_id => job_id)
+      response = link_client.read
       response.exit_status.should == 37
     end
 
     it "can kill everything ungracefully" do
-      client.stop(:handle => handle, :kill => true)
+      link_client.write(Warden::Protocol::LinkRequest.new(:handle => handle,
+                                                          :job_id => @job_id))
+
+
+      stop_client.stop(:handle => handle, :kill => true)
 
       # Test that no exit status is returned (because of SIGKILL)
-      response = client.link(:handle => handle, :job_id => job_id)
+      response = link_client.read
       response.exit_status.should == 255
     end
   end

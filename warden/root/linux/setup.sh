@@ -18,15 +18,10 @@ then
   rmdir /dev/cgroup
 fi
 
-cgroup_path=/sys/fs/cgroup
+cgroup_path=/tmp/warden/cgroup
 
-if [ ! -d $cgroup_path ]
-then
-  echo "$cgroup_path does not exist..."
-  exit 1
-fi
+mkdir -p $cgroup_path
 
-# Check if /sys/fs/cgroup is mounted with a cgroup mount, and umount if so
 if grep "${cgroup_path} " /proc/mounts | cut -d' ' -f3 | grep -q cgroup
 then
   find $cgroup_path -mindepth 1 -type d | sort | tac | xargs rmdir
@@ -63,4 +58,7 @@ then
   mount -o remount,usrjquota=aquota.user,grpjquota=aquota.group,jqfmt=vfsv0 $CONTAINER_DEPOT_MOUNT_POINT_PATH
   quotacheck -ugmb -F vfsv0 $CONTAINER_DEPOT_MOUNT_POINT_PATH
   quotaon $CONTAINER_DEPOT_MOUNT_POINT_PATH
+elif [ "$DISK_QUOTA_ENABLED" = "false" ] && ! quotaon -p $CONTAINER_DEPOT_MOUNT_POINT_PATH > /dev/null
+then
+  quotaoff $CONTAINER_DEPOT_MOUNT_POINT_PATH
 fi

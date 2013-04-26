@@ -1,11 +1,10 @@
 # coding: UTF-8
 
 require "spec_helper"
-require "warden/protocol/limit_bandwidth"
 
 describe Warden::Protocol::LimitBandwidthRequest do
   subject(:request) do
-    described_class.new(:handle => "handle")
+    described_class.new(:handle => "handle", :rate => 1, :burst => 1)
   end
 
   it_should_behave_like "wrappable request"
@@ -19,25 +18,23 @@ describe Warden::Protocol::LimitBandwidthRequest do
   end
 
   field :rate do
-    it_should_be_optional
+    it_should_be_required
     it_should_be_typed_as_uint64
   end
 
   field :burst do
-    it_should_be_optional
+    it_should_be_required
     it_should_be_typed_as_uint64
   end
 
   it "should respond to #create_response" do
     request.create_response.should be_a(Warden::Protocol::LimitBandwidthResponse)
   end
-
-  it_should_behave_like "documented request"
 end
 
 describe Warden::Protocol::LimitBandwidthResponse do
   subject(:response) do
-    described_class.new
+    described_class.new(:rate => 1, :burst => 1)
   end
 
   it_should_behave_like "wrappable response"
@@ -49,12 +46,12 @@ describe Warden::Protocol::LimitBandwidthResponse do
   it { should_not be_error }
 
   field :rate do
-    it_should_be_optional
+    it_should_be_required
     it_should_be_typed_as_uint64
   end
 
   field :burst do
-    it_should_be_optional
+    it_should_be_required
     it_should_be_typed_as_uint64
   end
 end

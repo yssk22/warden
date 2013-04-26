@@ -3,14 +3,15 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pwd.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/ipc.h>
 #include <sys/param.h>
+#include <sys/shm.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -22,33 +23,31 @@
 #include "barrier.h"
 #include "msg.h"
 #include "mount.h"
+#include "pty.h"
+#include "pwd.h"
 #include "un.h"
 #include "util.h"
 
 typedef struct wshd_s wshd_t;
 
 struct wshd_s {
-  int argc;
-  char **argv;
-
   /* Path to directory where server socket is placed */
-  const char *run_path;
+  char run_path[256];
 
   /* Path to directory containing hooks */
-  const char *lib_path;
+  char lib_path[256];
 
   /* Path to directory that will become root in the new mount namespace */
-  const char *root_path;
+  char root_path[256];
 
   /* Process title */
-  const char *title;
+  char title[32];
 
   /* File descriptor of listening socket */
   int fd;
 
   barrier_t barrier_parent;
   barrier_t barrier_child;
-  pid_t pid;
 
   /* Map pids to exit status fds */
   struct {
@@ -58,8 +57,8 @@ struct wshd_s {
   size_t pid_to_fd_len;
 };
 
-int wshd__usage(wshd_t *w) {
-  fprintf(stderr, "Usage: %s OPTION...\n", w->argv[0]);
+int wshd__usage(wshd_t *w, int argc, char **argv) {
+  fprintf(stderr, "Usage: %s OPTION...\n", argv[0]);
   fprintf(stderr, "\n");
 
   fprintf(stderr, "  --run PATH   "
@@ -81,20 +80,33 @@ int wshd__usage(wshd_t *w) {
   return 0;
 }
 
-int wshd__getopt(wshd_t *w) {
+int wshd__getopt(wshd_t *w, int argc, char **argv) {
   int i = 1;
-  int j = w->argc - i;
+  int j = argc - i;
+  int rv;
 
-  while (i < w->argc) {
+  while (i < argc) {
     if (j >= 2) {
-      if (strcmp("--run", w->argv[i]) == 0) {
-        w->run_path = strdup(w->argv[i+1]);
-      } else if (strcmp("--lib", w->argv[i]) == 0) {
-        w->lib_path = strdup(w->argv[i+1]);
-      } else if (strcmp("--root", w->argv[i]) == 0) {
-        w->root_path = strdup(w->argv[i+1]);
-      } else if (strcmp("--title", w->argv[i]) == 0) {
-        w->title = strdup(w->argv[i+1]);
+      if (strcmp("--run", argv[i]) == 0) {
+        rv = snprintf(w->run_path, sizeof(w->run_path), "%s", argv[i+1]);
+        if (rv >= sizeof(w->run_path)) {
+          goto toolong;
+        }
+      } else if (strcmp("--lib", argv[i]) == 0) {
+        rv = snprintf(w->lib_path, sizeof(w->lib_path), "%s", argv[i+1]);
+        if (rv >= sizeof(w->lib_path)) {
+          goto toolong;
+        }
+      } else if (strcmp("--root", argv[i]) == 0) {
+        rv = snprintf(w->root_path, sizeof(w->root_path), "%s", argv[i+1]);
+        if (rv >= sizeof(w->root_path)) {
+          goto toolong;
+        }
+      } else if (strcmp("--title", argv[i]) == 0) {
+        rv = snprintf(w->title, sizeof(w->title), "%s", argv[i+1]);
+        if (rv >= sizeof(w->title)) {
+          goto toolong;
+        }
       } else {
         goto invalid;
       }
@@ -102,10 +114,10 @@ int wshd__getopt(wshd_t *w) {
       i += 2;
       j -= 2;
     } else if (j == 1) {
-      if (strcmp("-h", w->argv[i]) == 0 ||
-          strcmp("--help", w->argv[i]) == 0)
+      if (strcmp("-h", argv[i]) == 0 ||
+          strcmp("--help", argv[i]) == 0)
       {
-        wshd__usage(w);
+        wshd__usage(w, argc, argv);
         return -1;
       } else {
         goto invalid;
@@ -117,9 +129,14 @@ int wshd__getopt(wshd_t *w) {
 
   return 0;
 
+toolong:
+  fprintf(stderr, "%s: argument too long -- %s\n", argv[0], argv[i]);
+  fprintf(stderr, "Try `%s --help' for more information.\n", argv[0]);
+  return -1;
+
 invalid:
-  fprintf(stderr, "%s: invalid option -- %s\n", w->argv[0], w->argv[i]);
-  fprintf(stderr, "Try `%s --help' for more information.\n", w->argv[0]);
+  fprintf(stderr, "%s: invalid option -- %s\n", argv[0], argv[i]);
+  fprintf(stderr, "Try `%s --help' for more information.\n", argv[0]);
   return -1;
 }
 
@@ -216,22 +233,9 @@ char **env__add(char **envp, const char *key, const char *value) {
   return envp;
 }
 
-char **child_setup_environment(msg_request_t *req) {
-  const char *user;
-  struct passwd *pw;
+char **child_setup_environment(struct passwd *pw) {
   int rv;
   char **envp = NULL;
-
-  user = req->user.name;
-  if (!strlen(user)) {
-    user = "root";
-  }
-
-  pw = getpwnam(user);
-  if (pw == NULL) {
-    perror("getpwnam");
-    return NULL;
-  }
 
   rv = chdir(pw->pw_dir);
   if (rv == -1) {
@@ -261,6 +265,8 @@ int child_fork(msg_request_t *req, int in, int out, int err) {
   }
 
   if (rv == 0) {
+    const char *user;
+    struct passwd *pw;
     char *default_argv[] = { "/bin/sh", NULL };
     char *default_envp[] = { NULL };
     char **argv = default_argv;
@@ -278,6 +284,21 @@ int child_fork(msg_request_t *req, int in, int out, int err) {
     rv = setsid();
     assert(rv != -1);
 
+    user = req->user.name;
+    if (!strlen(user)) {
+      user = "root";
+    }
+
+    pw = getpwnam(user);
+    if (pw == NULL) {
+      perror("getpwnam");
+      goto error;
+    }
+
+    if (strlen(pw->pw_shell)) {
+      default_argv[0] = strdup(pw->pw_shell);
+    }
+
     /* Set controlling terminal if needed */
     if (isatty(in)) {
       rv = ioctl(STDIN_FILENO, TIOCSCTTY, 1);
@@ -290,25 +311,25 @@ int child_fork(msg_request_t *req, int in, int out, int err) {
       assert(argv != NULL);
     }
 
-    /* Use resource limits from request */
     rv = msg_rlimit_export(&req->rlim);
     if (rv == -1) {
       perror("msg_rlimit_export");
-      exit(255);
+      goto error;
     }
 
-    /* Set user from request */
-    rv = msg_user_export(&req->user);
+    rv = msg_user_export(&req->user, pw);
     if (rv == -1) {
       perror("msg_user_export");
-      exit(255);
+      goto error;
     }
 
-    envp = child_setup_environment(req);
+    envp = child_setup_environment(pw);
     assert(envp != NULL);
 
     execvpe(argv[0], argv, envp);
     perror("execvpe");
+
+error:
     exit(255);
   }
 
@@ -340,33 +361,11 @@ int child_handle_interactive(int fd, wshd_t *w, msg_request_t *req) {
   fcntl_mix_cloexec(p[1][0]);
   fcntl_mix_cloexec(p[1][1]);
 
-  rv = posix_openpt(O_RDWR | O_NOCTTY);
+  rv = openpty(&p[0][0], &p[0][1], NULL);
   if (rv < 0) {
-    perror("posix_openpt");
+    perror("openpty");
     abort();
   }
-
-  p[0][0] = rv;
-
-  rv = grantpt(p[0][0]);
-  if (rv < 0) {
-    perror("grantpt");
-    abort();
-  }
-
-  rv = unlockpt(p[0][0]);
-  if (rv < 0) {
-    perror("unlockpt");
-    abort();
-  }
-
-  rv = open(ptsname(p[0][0]), O_RDWR);
-  if (rv < 0) {
-    perror("open");
-    abort();
-  }
-
-  p[0][1] = rv;
 
   fcntl_mix_cloexec(p[0][0]);
   fcntl_mix_cloexec(p[0][1]);
@@ -607,6 +606,65 @@ int child_loop(wshd_t *w) {
 /* No header defines this */
 extern int pivot_root(const char *new_root, const char *put_old);
 
+void child_save_to_shm(wshd_t *w) {
+  int rv;
+  void *w_;
+
+  rv = shmget(0xdeadbeef, sizeof(*w), IPC_CREAT | IPC_EXCL | 0600);
+  if (rv == -1) {
+    perror("shmget");
+    abort();
+  }
+
+  w_ = shmat(rv, NULL, 0);
+  if (w_ == (void *)-1) {
+    perror("shmat");
+    abort();
+  }
+
+  memcpy(w_, w, sizeof(*w));
+}
+
+wshd_t *child_load_from_shm(void) {
+  int rv;
+  wshd_t *w;
+  void *w_;
+
+  rv = shmget(0xdeadbeef, sizeof(*w), 0600);
+  if (rv == -1) {
+    perror("shmget");
+    abort();
+  }
+
+  w_ = shmat(rv, NULL, 0);
+  if (w_ == (void *)-1) {
+    perror("shmat");
+    abort();
+  }
+
+  w = malloc(sizeof(*w));
+  if (w == NULL) {
+    perror("malloc");
+    abort();
+  }
+
+  memcpy(w, w_, sizeof(*w));
+
+  rv = shmdt(w_);
+  if (w_ == (void *)-1) {
+    perror("shmdt");
+    abort();
+  }
+
+  rv = shmctl(0xdeadbeef, IPC_RMID, NULL);
+  if (w_ == (void *)-1) {
+    perror("shmctl");
+    abort();
+  }
+
+  return w;
+}
+
 int child_run(void *data) {
   wshd_t *w = (wshd_t *)data;
   int rv;
@@ -652,10 +710,35 @@ int child_run(void *data) {
   rv = run(pivoted_lib_path, "hook-child-after-pivot.sh");
   assert(rv == 0);
 
+  child_save_to_shm(w);
+
+  execl("/sbin/wshd", "/sbin/wshd", "--continue", NULL);
+  perror("exec");
+  abort();
+}
+
+int child_continue(int argc, char **argv) {
+  wshd_t *w;
+  int rv;
+
+  w = child_load_from_shm();
+
+  /* Process MUST not leak file descriptors to children */
+  barrier_mix_cloexec(&w->barrier_child);
+  fcntl_mix_cloexec(w->fd);
+
+  if (strlen(w->title) > 0) {
+    setproctitle(argv, w->title);
+  }
+
   rv = mount_umount_pivoted_root("/mnt");
   if (rv == -1) {
     exit(1);
   }
+
+  /* Detach this process from its original group */
+  rv = setsid();
+  assert(rv > 0 && rv == getpid());
 
   /* Signal parent */
   rv = barrier_signal(&w->barrier_child);
@@ -758,51 +841,34 @@ int main(int argc, char **argv) {
   wshd_t *w;
   int rv;
 
+  /* Continue child execution in the context of the container */
+  if (argc > 1 && strcmp(argv[1], "--continue") == 0) {
+    return child_continue(argc, argv);
+  }
+
   w = calloc(1, sizeof(*w));
   assert(w != NULL);
 
-  w->argc = argc;
-  w->argv = argv;
-
-  rv = wshd__getopt(w);
+  rv = wshd__getopt(w, argc, argv);
   if (rv == -1) {
     exit(1);
   }
 
-  if (w->run_path == NULL) {
-    w->run_path = "run";
+  if (strlen(w->run_path) == 0) {
+    strcpy(w->run_path, "run");
   }
 
-  if (w->lib_path == NULL) {
-    w->lib_path = "lib";
+  if (strlen(w->lib_path) == 0) {
+    strcpy(w->lib_path, "lib");
   }
 
-  if (w->root_path == NULL) {
-    w->root_path = "root";
-  }
-
-  if (w->title != NULL) {
-    setproctitle(argv, w->title);
+  if (strlen(w->root_path) == 0) {
+    strcpy(w->root_path, "root");
   }
 
   assert_directory(w->run_path);
   assert_directory(w->lib_path);
   assert_directory(w->root_path);
-
-  /*
-   * Trigger NSS initialization.
-   *
-   * NSS is initialized on the first call to a function defined in <pwd.h>,
-   * such as getpwnam, getpwuid, getpwent, etc.
-   *
-   * If this initialization step happens _after_ pivot_root(2) the shared
-   * libraries that are picked up may be different from the ones that the
-   * already loaded libc expects, causing inexplicable crashes.
-   *
-   * To prevent a shared library incompatibility, trigger initialization of the
-   * NSS before modifying the environment.
-   */
-  getpwuid(0);
 
   parent_run(w);
 
