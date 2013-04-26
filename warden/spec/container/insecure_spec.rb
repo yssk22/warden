@@ -9,14 +9,6 @@ require "warden/util"
 
 require "warden/container/insecure"
 
-def next_class_c
-  $class_c ||= Warden::Network::Address.new("172.16.0.0")
-
-  rv = $class_c
-  $class_c = $class_c + 256
-  rv
-end
-
 describe "insecure" do
   let(:work_path) { File.join(Dir.tmpdir, "warden", "spec") }
   let(:unix_domain_path) { File.join(work_path, "warden.sock") }
@@ -34,8 +26,8 @@ describe "insecure" do
   end
 
   after do
-    `kill -9 -#{@pid}`
-    Process.waitpid(@pid)
+    Process.kill("KILL", -@pid) rescue Errno::ECHILD
+    Process.waitpid(@pid) rescue Errno::ECHILD
 
     # Destroy all artifacts
     Dir[File.join(Warden::Util.path("root"), "*", "clear.sh")].each do |clear|
@@ -58,12 +50,16 @@ describe "insecure" do
           "unix_domain_path" => unix_domain_path,
           "container_klass" => container_klass,
           "container_depot_path" => container_depot_path,
-          "container_grace_time" => 5 },
+          "container_grace_time" => 5,
+          "job_output_limit" => 100 * 1024 },
         "network" => {
           "pool_start_address" => start_address,
           "pool_size" => 64,
           "allow_networks" => ["4.2.2.3/32"],
           "deny_networks" => ["4.2.2.0/24"] },
+        "port" => {
+          "pool_start_port" => 64000,
+          "pool_size" => 1000 },
         "logging" => {
           "level" => "debug",
           "file" => File.join(work_path, "warden.log") }
@@ -92,7 +88,6 @@ describe "insecure" do
 
   it_should_behave_like "lifecycle"
   it_should_behave_like "running commands"
-  it_should_behave_like "streaming commands"
   it_should_behave_like "info"
   it_should_behave_like "file transfer"
   it_should_behave_like "drain"
@@ -120,7 +115,9 @@ describe "insecure" do
 
       # Connect via external IP
       external_ip = `ip route get 1.1.1.1`.split(/\n/).first.split(/\s+/).last
-      `nc #{external_ip} #{response.host_port}`.chomp.should == "ok"
+
+      # Pipe echo to give nc a stdin (it quits immediately after connecting if it doesn't have a stdin)
+      `echo | nc #{external_ip} #{response.host_port}`.chomp.should == "ok"
 
       # Clean up
       client.link(:handle => handle, :job_id => job_id)

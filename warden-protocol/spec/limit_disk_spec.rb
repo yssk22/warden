@@ -1,12 +1,11 @@
 # coding: UTF-8
 
 require "spec_helper"
-require "warden/protocol/limit_disk"
 
 shared_examples "disk limiting" do
   field :block_limit do
     it_should_be_optional
-    it_should_be_typed_as_uint32
+    it_should_be_typed_as_uint64
   end
 
   field :block do
@@ -26,7 +25,7 @@ shared_examples "disk limiting" do
 
   field :inode_limit do
     it_should_be_optional
-    it_should_be_typed_as_uint32
+    it_should_be_typed_as_uint64
   end
 
   field :inode do
@@ -46,7 +45,7 @@ shared_examples "disk limiting" do
 
   field :byte_limit do
     it_should_be_optional
-    it_should_be_typed_as_uint32
+    it_should_be_typed_as_uint64
   end
 
   field :byte do
@@ -85,8 +84,6 @@ describe Warden::Protocol::LimitDiskRequest do
   it "should respond to #create_response" do
     request.create_response.should be_a(Warden::Protocol::LimitDiskResponse)
   end
-
-  it_should_behave_like "documented request"
 end
 
 describe Warden::Protocol::LimitDiskResponse do

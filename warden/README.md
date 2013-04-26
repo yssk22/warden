@@ -1,6 +1,9 @@
 # warden
 
-A framework for managing isolated and resource controlled environments.
+> This README describes the **server** component. Please refer to the top
+> level [README][tlr] for an overview of all components.
+
+[tlr]: /README.md
 
 ## Introduction
 
@@ -28,7 +31,7 @@ sudo apt-get install -y linux-image-generic-lts-backport-natty
 #### Install dependencies
 
 ```
-sudo apt-get install -y build-essential debootstrap
+sudo apt-get install -y build-essential debootstrap quota
 ```
 
 #### Setup Warden
@@ -57,7 +60,7 @@ sudo bundle exec rake warden:start[config/linux.yml]
 #### Interact with Warden
 
 ```
-bundle exec bin/warden-repl
+bundle exec bin/warden
 ```
 
 ## Implementation for Linux
@@ -364,6 +367,17 @@ Other dependencies are:
 
 Further bootstrapping of Warden can be done by running `rake setup`.
 
+## Logs
+
+Warden uses [steno](https://github.com/cloudfoundry/steno) for its logging. Here are some examples for each log level:
+
+* `error` - a command has timed out or printed too much output
+* `warn` - a shell command sent to a container has failed
+* `info` - a container is being destroyed due to a timeout, warden displays how long a command
+took
+* `debug2` - a shell command sent to a container has succeeded, a timer has been set or stopped
+* `debug` - a snapshot has been taken, a container was created or destroyed normally
+
 ## Hacking
 
 The included tests create and destroy real containers, so require system
@@ -371,3 +385,10 @@ prerequisites to be in place. They need to be run as root if the backend
 to be tested requires it.
 
 See `root/<backend>/README.md` for backend-specific information.
+
+## License
+
+The project is licensed under the Apache 2.0 license (see the
+[`LICENSE`][license] file in the root directory of the repository).
+
+[license]: /LICENSE

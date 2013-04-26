@@ -9,7 +9,8 @@ module Warden
         "unix_domain_path"        => "/tmp/warden.sock",
         "unix_domain_permissions" => 0755,
         "container_klass"         => "Warden::Container::Insecure",
-        "container_grace_time"    => (5 * 60), # 5 minutes,
+        "container_grace_time"    => (5 * 60), # 5 minutes
+        "job_output_limit"        => (10 * 1024 * 1024), # 10 megabytes
         "quota" => {
           "disk_quota_enabled" => true,
         },
@@ -52,6 +53,9 @@ module Warden
             optional("sigpending") => Integer,
             optional("stack")      => Integer,
           },
+
+          "job_output_limit" => Integer,
+
           "quota" => {
             optional("disk_quota_enabled") => bool,
           },
@@ -77,20 +81,49 @@ module Warden
 
     def self.network_defaults
       {
-        "pool_start_address" => "10.254.0.0",
-        "pool_size"          => 64,
-        "deny_networks"      => [],
-        "allow_networks"     => [],
+        "pool_network"   => "10.254.0.0/24",
+        "deny_networks"  => [],
+        "allow_networks" => [],
       }
     end
 
     def self.network_schema
       ::Membrane::SchemaParser.parse do
         {
-          "pool_start_address" => String,
-          "pool_size"          => Integer,
+          # Preferred way to specify networks to pool
+          optional("pool_network") => String,
+
+          # Present for Backwards compatibility
+          optional("pool_start_address") => String,
+          optional("pool_size")          => Integer,
+
           "deny_networks"      => [String],
           "allow_networks"     => [String],
+        }
+      end
+    end
+
+    def self.ip_local_port_range
+      File.read("/proc/sys/net/ipv4/ip_local_port_range").split.map(&:to_i)
+    end
+
+    def self.port_defaults
+      _, ephemeral_stop = self.ip_local_port_range
+      start = ephemeral_stop + 1
+      stop = 65000 + 1
+      count = stop - start
+
+      {
+        "pool_start_port" => start,
+        "pool_size"       => count,
+      }
+    end
+
+    def self.port_schema
+      ::Membrane::SchemaParser.parse do
+        {
+          "pool_start_port" => Integer,
+          "pool_size"       => Integer,
         }
       end
     end
@@ -117,6 +150,7 @@ module Warden
     attr_reader :health_check_server
     attr_reader :logging
     attr_reader :network
+    attr_reader :port
     attr_reader :user
 
     def initialize(config)
@@ -133,6 +167,7 @@ module Warden
         merge(config["health_check_server"] || {})
       @logging = self.class.logging_defaults.merge(config["logging"] || {})
       @network = self.class.network_defaults.merge(config["network"] || {})
+      @port = self.class.port_defaults.merge(config["port"] || {})
       @user = self.class.user_defaults.merge(config["user"] || {})
     end
 
@@ -140,6 +175,7 @@ module Warden
       self.class.server_schema.validate(@server)
       self.class.logging_schema.validate(@logging)
       self.class.network_schema.validate(@network)
+      self.class.port_schema.validate(@port)
       self.class.user_schema.validate(@user)
     end
 
@@ -150,10 +186,31 @@ module Warden
 
       @network["deny_networks"]  = @network["deny_networks"].compact
       @network["allow_networks"] = @network["allow_networks"].compact
+
+      # Transform pool_start_address/pool_size into pool_network if needed
+      if @network.has_key?("pool_start_address") && @network.has_key?("pool_size")
+        pool_start_address = @network.delete("pool_start_address")
+        pool_size = @network.delete("pool_size").to_i
+
+        # Determine number of fixed bits in netmask
+        fixed_bits = Math.log2(pool_size).ceil + 2
+
+        @network["pool_network"] = "%s/%d" % [pool_start_address, 32-fixed_bits]
+      end
     end
 
     def rlimits
       @server["container_rlimits"] || {}
+    end
+
+    def to_hash
+      {
+        "server"  => server,
+        "logging" => logging,
+        "network" => network,
+        "port"    => port,
+        "user"    => user,
+      }
     end
   end
 end

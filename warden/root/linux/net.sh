@@ -5,7 +5,7 @@ set -o nounset
 set -o errexit
 shopt -s nullglob
 
-filter_dispatch_chain="warden-dispatch"
+filter_forward_chain="warden-forward"
 filter_default_chain="warden-default"
 filter_instance_prefix="warden-instance-"
 nat_prerouting_chain="warden-prerouting"
@@ -21,9 +21,31 @@ function external_ip() {
   ip route get 8.8.8.8 | sed 's/.*src\s\(.*\)\s/\1/;tx;d;:x'
 }
 
+function teardown_deprecated_rules() {
+  # Remove jump to warden-dispatch from INPUT
+  iptables -S INPUT 2> /dev/null |
+    grep " -j warden-dispatch" |
+    sed -e "s/-A/-D/" -e "s/\s\+\$//" |
+    xargs --no-run-if-empty --max-lines=1 iptables
+
+  # Remove jump to warden-dispatch from FORWARD
+  iptables -S FORWARD 2> /dev/null |
+    grep " -j warden-dispatch" |
+    sed -e "s/-A/-D/" -e "s/\s\+\$//" |
+    xargs --no-run-if-empty --max-lines=1 iptables
+
+  # Prune warden-dispatch
+  iptables -F warden-dispatch 2> /dev/null || true
+
+  # Delete warden-dispatch
+  iptables -X warden-dispatch 2> /dev/null || true
+}
+
 function teardown_filter() {
-  # Prune dispatch chain
-  iptables -S ${filter_dispatch_chain} 2> /dev/null |
+  teardown_deprecated_rules
+
+  # Prune warden-forward chain
+  iptables -S ${filter_forward_chain} 2> /dev/null |
     grep "\-g ${filter_instance_prefix}" |
     sed -e "s/-A/-D/" -e "s/\s\+\$//" |
     xargs --no-run-if-empty --max-lines=1 iptables
@@ -40,52 +62,45 @@ function teardown_filter() {
     sed -e "s/-N/-X/" -e "s/\s\+\$//" |
     xargs --no-run-if-empty --max-lines=1 iptables
 
-  # Remove jump to dispatch from INPUT
-  iptables -S INPUT 2> /dev/null |
-    grep " -j ${filter_dispatch_chain}" |
-    sed -e "s/-A/-D/" -e "s/\s\+\$//" |
-    xargs --no-run-if-empty --max-lines=1 iptables
-
-  # Remove jump to dispatch from FORWARD
+  # Remove jump to warden-forward from FORWARD
   iptables -S FORWARD 2> /dev/null |
-    grep " -j ${filter_dispatch_chain}" |
+    grep " -j ${filter_forward_chain}" |
     sed -e "s/-A/-D/" -e "s/\s\+\$//" |
     xargs --no-run-if-empty --max-lines=1 iptables
 
-  # Flush dispatch chain
-  iptables -F ${filter_dispatch_chain} 2> /dev/null || true
-
-  # Flush default chain
+  iptables -F ${filter_forward_chain} 2> /dev/null || true
   iptables -F ${filter_default_chain} 2> /dev/null || true
 }
 
 function setup_filter() {
   teardown_filter
 
-  # Create or flush dispatch chain
-  iptables -N ${filter_dispatch_chain} 2> /dev/null || iptables -F ${filter_dispatch_chain}
-  iptables -A ${filter_dispatch_chain} -j DROP
-
-  # If the packet is NOT a canonical SYN packet, allow immediately
-  iptables -I ${filter_dispatch_chain} 1 -p tcp ! --syn --jump ACCEPT
+  # Create or flush forward chain
+  iptables -N ${filter_forward_chain} 2> /dev/null || iptables -F ${filter_forward_chain}
+  iptables -A ${filter_forward_chain} -j DROP
 
   # Create or flush default chain
   iptables -N ${filter_default_chain} 2> /dev/null || iptables -F ${filter_default_chain}
 
-  # Whitelist
-  for n in "${ALLOW_NETWORKS}"; do
-    if [${n} -eq '']; then break; fi
-    iptables -A ${filter_default_chain} --destination "${n}" --jump RETURN
+  for n in ${ALLOW_NETWORKS}; do
+    if [ "$n" == "" ]
+    then
+      break
+    fi
+
+    iptables -A ${filter_default_chain} --destination "$n" --jump RETURN
   done
 
-  for n in "${DENY_NETWORKS}"; do
-    if [${n} -eq '']; then break; fi
-    iptables -A ${filter_default_chain} --destination "${n}" --jump DROP
+  for n in ${DENY_NETWORKS}; do
+    if [ "$n" == "" ]
+    then
+      break
+    fi
+
+    iptables -A ${filter_default_chain} --destination "$n" --jump DROP
   done
 
-  # Bind chain
-  iptables -A INPUT -i w-+ --jump ${filter_dispatch_chain}
-  iptables -A FORWARD -i w-+ --jump ${filter_dispatch_chain}
+  iptables -A FORWARD -i w-+ --jump ${filter_forward_chain}
 }
 
 function teardown_nat() {
@@ -142,7 +157,7 @@ function setup_nat() {
   # Enable NAT for traffic coming from containers
   (iptables -t nat -S ${nat_postrouting_chain} | grep -q "\-j SNAT\b") ||
     iptables -t nat -A ${nat_postrouting_chain} \
-      --source 10.254.0.0/16 \
+      --source ${POOL_NETWORK} \
       --jump SNAT \
       --to $(external_ip)
 }

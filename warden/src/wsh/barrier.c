@@ -18,9 +18,6 @@ int barrier_open(barrier_t *bar) {
     goto err;
   }
 
-  fcntl_mix_cloexec(aux[0]);
-  fcntl_mix_cloexec(aux[1]);
-
   bar->fd[0] = aux[0];
   bar->fd[1] = aux[1];
   return 0;
@@ -36,22 +33,31 @@ void barrier_close(barrier_t *bar) {
   close(bar->fd[1]);
 }
 
+void barrier_mix_cloexec(barrier_t *bar) {
+  fcntl_mix_cloexec(bar->fd[0]);
+  fcntl_mix_cloexec(bar->fd[1]);
+}
+
 void barrier_close_wait(barrier_t *bar) {
   close(bar->fd[0]);
+  bar->fd[0] = -1;
 }
 
 void barrier_close_signal(barrier_t *bar) {
   close(bar->fd[1]);
+  bar->fd[1] = -1;
 }
 
 int barrier_wait(barrier_t *bar) {
-  char buf[1];
   int nread;
+  char buf[1];
 
-  /* Close signal side of pipe on wait */
   barrier_close_signal(bar);
 
   nread = read(bar->fd[0], buf, sizeof(buf));
+
+  barrier_close_wait(bar);
+
   if (nread == -1) {
     perror("read");
     return -1;
@@ -63,14 +69,16 @@ int barrier_wait(barrier_t *bar) {
 }
 
 int barrier_signal(barrier_t *bar) {
-  int rv;
+  int nwritten;
   char byte = '\0';
 
-  /* Close wait side of pipe on signal */
   barrier_close_wait(bar);
 
-  rv = write(bar->fd[1], &byte, 1);
-  if (rv == -1) {
+  nwritten = write(bar->fd[1], &byte, 1);
+
+  barrier_close_signal(bar);
+
+  if (nwritten == -1) {
     perror("write");
     return -1;
   }
